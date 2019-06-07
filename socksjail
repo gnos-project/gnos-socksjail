@@ -1,0 +1,252 @@
+#!/bin/bash
+
+# DOC     https://github.com/ambrop72/badvpn/wiki/Tun2socks
+#         http://abregman.com/2016/09/29/linux-network-namespace/
+# UDP     TRUSTY https://launchpad.net/~ambrop7/+archive/ubuntu/badvpn/+packages
+# DEPS    badvpn-tun2socks dnscrypt-proxy
+# TOCHECK https://blog.cloudflare.com/welcome-hidden-resolver/
+
+
+########
+# FUNC #
+########
+
+
+# FUNC: System
+
+Usage ()
+{
+    local self="$( basename "$( readlink -f "$BASH_SOURCE" )" )"
+    cat <<EOF >&2
+USAGE:
+  $self [ -r ] [ -v ] [ PROFILE_NAME | PROFILE_PATH [ COMMAND [ ARGS ... ] ] ]
+  $self -d PROFILE_NAME
+  $self -l
+  $self -h
+
+ARGS:
+  PROFILE_NAME    Profile name, stored in $profilePath/
+  PROFILE_PATH    Profile path
+  COMMAND         Command to execute, or "null" to keep connected
+  ARGS            Command arguments
+
+OPTS:
+  -d              Disconnect profile
+  -l              List active profiles
+  -h              Show help
+  -r              Force reconnect
+  -v              Verbose output
+
+EOF
+    exit 1
+}
+
+Help ()
+{
+    cat <<EOF >&2
+NAME: $( basename "$( readlink -f "$BASH_SOURCE" )" )
+DESC: SOCKSify using tun2socks & netns 
+AUTH: elias@gnos.in
+DEPS: badvpn-tun2socks dnscrypt-proxy policykit-1
+FEAT:
+  netns (Linux network namespaces)
+  DNS over HTTPS (dnscrypt-proxy)
+  user profiles with command execution
+  polkit integration
+
+$( Usage 2>&1 )
+
+PROFILE-FORMAT:  BASH
+  addr           SOCKS proxy address: [IP]:PORT
+  auth           SOCKS proxy credentials: USER[:PASS]
+  cmd            Command to execute in jail
+  pre            Command to execute before
+  post           Command to execute after
+EOF
+    exit 0
+}
+
+Die ()
+{
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+Say ()
+{
+    [[ -n "$verbose" ]] && echo "$@" >&2
+    return 0
+}
+
+
+# FUNC: Net
+CheckNetnsExists () # $1:NAME
+{
+    for i in $( ip netns list ) ; do
+        [[ "$i" == "$prefix$1" ]] && return 0
+    done
+    return 1
+}
+
+
+
+########
+# INIT #
+########
+
+
+# INIT: Constants
+prefix="socks_"
+sudoCmd="pkexec"
+appPath="$( dirname "$( readlink -f "$BASH_SOURCE" )" )"
+if [[ $( id -u ) == "0" ]] ; then
+    sudoCmd=""
+    [[ -n "$PKEXEC_UID" || -n "$SUDO_UID" ]] \
+&& HOME="$( getent passwd ${PKEXEC_UID:-$SUDO_UID} | cut -f 6 -d ":" )"
+fi
+profilePath="$HOME/.config/socksjail"
+appCachePath="$HOME/.cache/socksjail"
+
+
+# INIT: Check netns
+cnetns=$( ip netns identify $$ )
+[[ $cnetns =~ ^$prefix ]] && Die "Cannot run recursively, netns: $cnetns"
+
+
+# INIT: Parse opts
+while getopts hlivdru opt ; do
+    case "$opt" in
+        h) Help ; exit     ;;
+        l) list='-l'       ;;
+        i) install='-i'    ;;
+        v) verbose='-v'    ;;
+        d) disconnect='-d' ;;
+        r) reconnect='-r'  ;;
+        [?]) Usage ;;
+    esac
+done
+shift $((OPTIND-1))
+
+
+# INIT: Alternative actions: List
+if [[ -n "$list" && -z "$disconnect" && $# -eq 0 ]] ; then
+    $sudoCmd "$appPath/socksjail-priv" $list "" "$appCachePath"
+    exit $?
+elif [[ -z "$list" &&  -n "$disconnect" && $# -eq 1 ]] ; then
+    :
+elif [[ -n "$list$disconnect" ]] ; then
+    Usage
+fi
+
+
+# INIT: Sample Profiles
+if [[ ! -d "$profilePath" ]] ; then
+    mkdir -p "$profilePath"
+    cat <<'EOF' >"$profilePath/default"
+addr=':1080'
+EOF
+fi
+
+# INIT: Profile
+pre=
+cmd=
+profile="$1"
+shift
+[[ -z "$profile" ]] && profile=default
+
+if [[ -f "$profile" ]] && bash -n "$profile" ; then
+    profileFile="$( readlink -f "$profile" )"
+elif [[ -f "$profilePath/$profile" ]] && bash -n "$profilePath/$profile" ; then
+    profileFile="$( readlink -f "$profilePath/$profile" )"
+else
+    Die "Invalid profile: $profile"
+fi
+profileName="$( basename "$profileFile" )"
+   [[ "$( echo -n "$profileName" | tr -c '_[:alnum:]' '-' )" == "$profileName" ]] \
+|| Die "Profile name has invalid characters: $profileName"
+source "$profileFile"
+
+
+# INIT: Profile defaults
+[[ -z "$cmd" ]] && cmd='bash'
+
+
+# INIT: Alternative action: Disconnect
+if [[ -z "$list" &&  -n "$disconnect" && $# -eq 0 ]] ; then
+    $sudoCmd "$appPath/socksjail-priv" $verbose $disconnect $profileFile "$appCachePath"
+    exit $?
+fi
+
+
+# INIT: Check DEPS
+
+## DEPS: self
+for i in socksjail-priv ; do
+    if [[ ! -f "$appPath/$i" ]] ; then
+        Die "Missing internal: $i"
+    fi
+done
+
+## DEPS: policykit-1
+if [[ $( id -u ) != "0" ]] ; then
+     pkexec --version &>/dev/null || Die "Missing dependency: policykit-1"
+fi
+
+## DEPS: badvpn-tun2socks dnscrypt-proxy
+for dep in badvpn-tun2socks dnscrypt-proxy ; do
+    which $dep &>/dev/null || Die "Missing dependency: $dep"
+done
+
+# INIT: Alternative action: Install
+if [[ -n "$install" ]] ; then
+  Say "Installation succedeed"
+  exit 0
+fi
+
+
+# INIT: Check Profile
+
+## Check addr
+[[ -z $addr ]] && Die "Invalid profile: empty \$addr"
+
+## Merge cmd
+if [[ $# -eq 0 && -n "$cmd" && "$cmd" != "null" ]] ; then
+    eval exec bash "$( readlink -f "$BASH_SOURCE" )" $verbose $disconnect $reconnect $update "$profileFile" $cmd
+fi
+
+## Check cmd
+if [[ $# -ne 0 && "$1" != "null" ]] ; then
+    which "$1" &>/dev/null || Die "Unknown command: $1"
+fi
+
+### Check existing
+if [[ -z "$reconnect" ]] && [[ $cmd == "null" ]] && CheckNetnsExists "$profileName" ; then
+    Say "Existing netns, try -r to force reconnect"
+    exit 0
+fi
+
+
+
+########
+# MAIN #
+########
+
+
+# Pre-command
+if [[ -n $pre ]] ; then
+  Say "Running pre-command: $post"
+  eval $pre || Die "Pre-command returned: $?"
+fi
+
+
+# Check SOCKS
+[[ $addr =~ ^: ]] && localhost=localhost
+code=$( curl -L -s -o /dev/null -w "%{http_code}" \
+              --proxy "socks4a://${auth+$auth@}$localhost$addr" \
+              "https://9.9.9.10/dns-query?name=quad9.net"
+      )
+[[ $code == "200" ]] || Die "Failed to connect SOCKS server: $addr"
+
+
+# Privileged
+$sudoCmd "$appPath/socksjail-priv" $verbose $reconnect "$profileFile" "$appCachePath" "$(pwd)" "$DISPLAY" "$@"

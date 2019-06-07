@@ -1,0 +1,349 @@
+#!/bin/bash
+# ARGS $1: profileFile
+# ARGS $2: cachePath
+# ARGS $3: nodePath
+# ARGS $4: cmdPath
+# ARGS $5: cmdDisplay
+# ARGS $*: cmd
+
+
+
+########
+# FUNC #
+########
+
+# FUNC: System
+
+Usage ()
+{
+    Die "Usage: INTERNAL"
+}
+
+Die ()
+{
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+Say ()
+{
+    [[ -n "$verbose" ]] && echo "$@" >&2
+    return 0
+}
+
+GetChildren()
+{
+    local all= sub= cur=$1
+    sub=$(ps --ppid $cur -o pid h)
+    for pid in $sub ; do all="$( GetChildren $pid ) $all" ; done
+    echo "$cur $all"
+}
+
+
+
+# FUNC
+
+CheckNetnsExists () # $1:NAME
+{
+    for i in $( ip netns list 2>/dev/null ) ; do
+        [[ "$i" == "$prefix$1" ]] && return 0
+    done
+    return 1
+}
+
+Connect ()
+{
+    if_tun=$nsName
+    ip_tun=10.127.0.1
+    ip_nif=10.127.0.2
+    mask=255.255.255.0
+    cidr=24
+
+
+    mkdir -p "$cachePath/$profileName/"
+    chown --reference="$cachePath" "$cachePath/$profileName"
+
+
+    Say "Creating netns: $nsName"
+    ip netns add $nsName
+    [[ -z "$( ip netns show $nsName 2>/dev/null)" ]] && Die "Failed to create namespace"
+    mkdir -p /etc/netns/$nsName/
+
+
+    Say "Linking SOCKS proxy: $addr"
+    ip tuntap add $if_tun mode tun || Die "Failed to create tun interface: $if_tun"
+    ip addr add "$ip_tun/$cidr" dev $if_tun || Die "Failed to configure tun interface: $if_tun"
+
+    if [[ $auth =~ :. ]] ; then
+        local socksUser=${auth%%:*}
+        local socksPass=${auth#*:}
+    elif [[ $auth =~ :$ ]] ; then
+        local socksUser=${auth%%:*}
+        local socksPass=
+    elif [[ -n $auth ]] ; then
+        local socksUser=$auth
+    fi
+
+    [[ $addr =~ ^: ]] && local localhost=localhost
+    sudo --set-home -u \#${PKEXEC_UID:-$SUDO_UID} badvpn-tun2socks \
+        --tundev $if_tun \
+        --netif-ipaddr $ip_nif \
+        --netif-netmask $mask \
+        --socks-server-addr $localhost$addr \
+        ${socksUser+--username "$socksUser"} \
+        ${socksPass+--password "$socksPass"} \
+        --loglevel 0 &  # DBG --loglevel 4
+
+    local tun2socksPid=$!
+    echo $tun2socksPid >"$cachePath/$profileName/tun2socks.pid"
+    chown --reference="$cachePath/$profileName" "$cachePath/$profileName/tun2socks.pid"
+    sleep 1
+
+    Say "Configuring interface: $if_tun"
+
+    ip link set $if_tun netns $nsName
+    ip netns exec $nsName ip link set dev lo up
+
+    ip netns exec $nsName ip addr add $ip_tun dev $if_tun
+    ip netns exec $nsName ip link set dev $if_tun up
+
+    ip netns exec $nsName ip route add $ip_nif dev $if_tun
+    ip netns exec $nsName ip route add default via $ip_nif
+
+
+    Say "Starting dnscrypt-proxy"
+    echo "nameserver $ip_tun" >/etc/netns/$nsName/resolv.conf
+    local userName=$( getent passwd ${PKEXEC_UID:-$SUDO_UID} | cut -f 1 -d ":" )
+    cat <<EOF >"$cachePath/$profileName/dnscrypt-proxy.toml"
+listen_addresses = ['$ip_tun:53']
+user_name = '$userName'
+
+# cache = true
+# cache_size = 512
+# cache_min_ttl = 600
+# cache_max_ttl = 86400
+# cache_neg_min_ttl = 60
+# cache_neg_max_ttl = 600
+
+[query_log]
+file = '/tmp/dnsq'
+format = 'tsv'
+
+[static]
+[static.'default']
+stamp = '$sdns'
+EOF
+# DBG
+# [query_log]
+# file = '/tmp/dnsq'
+# format = 'tsv'
+    chown --reference="$cachePath/$profileName" "$cachePath/$profileName/dnscrypt-proxy.toml"
+
+    ip netns exec $nsName sudo nohup dnscrypt-proxy \
+        -config "$cachePath/$profileName/dnscrypt-proxy.toml" \
+        -loglevel 0 -logfile /tmp/dns \
+        </dev/null &>/dev/null &
+        # DBG -loglevel 0 -logfile /tmp/dns \
+}
+
+Disconnect ()
+{
+    local profileFile=$1
+    local profileName="$( basename $profileFile )"
+    local nsName=$prefix$profileName
+
+    Say "Disconnecting profile: $profileName"
+
+    {
+        # Kill tun2socks
+        local pids=$( GetChildren $( <"$cachePath/$profileName/tun2socks.pid" ) )
+        kill -15 $pids
+        sleep .5
+        kill -9 $pids
+
+        # Kill processes
+        pids=$( ip netns pids $nsName )
+        [[ -n "$pids" ]] && kill -15 $pids
+        sleep 1
+        pids=$( ip netns pids $nsName )
+        [[ -n "$pids" ]] && kill -9 $pids
+
+        # Clean netns
+        ip netns delete $nsName
+        rm -rf "/etc/netns/$nsName/"
+
+        # Free tun interface
+        ip tuntap del dev $nsName mode tun
+
+        # Clean profile cache
+        if [[ -d "$cachePath/$profileName" ]] ; then
+            rm "$cachePath/$profileName/dnscrypt-proxy.toml" "$cachePath/$profileName/tun2socks.pid"
+            rmdir "$cachePath/$profileName"
+        fi
+
+    } &>/dev/null # Hide garbage
+
+    # Post-command
+    post=
+    source "$profileFile"
+    if [[ -n $post ]] ; then
+        Say "Running post-command: $post"
+        sudo --set-home -u \#${PKEXEC_UID:-$SUDO_UID} bash -c "eval '$post'"
+    fi
+
+    return 0
+}
+
+
+List ()
+{
+    local sep profileName status dhcpPids userPids
+
+    for ns in $( ip netns list ) ; do
+
+        [[ $ns =~ ^$prefix ]] || continue
+        echo -e -n "$sep"
+        
+        profileName=${ns#$prefix*}
+        
+        local userPids=$( ip netns pids $ns )
+
+        local tun2socksPid=$( <"$cachePath/$profileName/tun2socks.pid" )
+        tun2socksPid=$( GetChildren $tun2socksPid )
+
+        echo -e "# \e[1m$profileName\e[0m"
+
+           [[ -n "$userPids" ]] \
+        && ps --no-headers --forest --format pid,tname,user,cmd $tun2socksPid $userPids 2>/dev/null
+
+        sep="\n"
+
+    done
+
+    exit 0
+}
+
+########
+# INIT #
+########
+
+
+# INIT: Constants
+appPath="$( dirname "$( readlink -f "$BASH_SOURCE" )" )"
+prefix=socks_
+
+
+# INIT: DOH IP-only stamps, use: https://dnscrypt.info/stamps/
+sdns='sdns://AgYAAAAAAAAACDkuOS45LjEwAAg5LjkuOS4xMAovZG5zLXF1ZXJ5' # quad9
+
+
+# INIT: Check root
+[[ $( id -u ) != "0" ]] && Die "Requires root privs"
+
+
+# INIT: Parse opts
+while getopts lvdrp:s: opt ; do
+    case "$opt" in
+        l) list='-l'       ;;
+        v) verbose='-v'    ;;
+        d) disconnect='-d' ;;
+        r) reconnect='-r'  ;;
+        [?]) Usage ;;
+    esac
+done
+shift $((OPTIND-1))
+
+profileFile=$1
+cachePath=$2
+cmdPath=$3
+cmdDisplay=$4
+
+
+# INIT: Alternative actions
+if [[ -n "$list" ]] ; then
+    List
+    exit $?
+elif [[ -n "$disconnect" && $# -ge 1 ]] ; then
+    Disconnect "$1"
+    exit $?
+fi
+
+
+# INIT: Check args
+   [[ $# -lt 4 ]] \
+&& Die "Invalid args count"
+
+shift 4
+
+
+# INIT: Profile
+auth=
+source "$profileFile"
+profileName="$( basename "$profileFile" )"
+
+
+# INIT: Defaults
+nicName=$prefix$profileName
+nsName=$nicName
+[[ -z "$cmd" ]]    && cmd=bash
+
+
+# # INIT: DEPS: dnscrypt-proxy
+# if ! which dnscrypt-proxy &>/dev/null ; then
+#        add-apt-repository --yes ppa:shevchuk/dnscrypt-proxy \
+#     && apt update \
+#     && apt install dnscrypt-proxy \
+#     && systemctl stop dnscrypt-proxy.socket  \
+#     && systemctl mask dnscrypt-proxy.socket  \
+#     && systemctl stop dnscrypt-proxy.service \
+#     && systemctl mask dnscrypt-proxy.service \
+#     || Die "Failed installing apt package: dnscrypt-proxy"
+# fi
+
+
+
+########
+# MAIN #
+########
+
+
+if [[ -z "$reconnect" ]] && CheckNetnsExists "$profileName" ; then
+
+    # Existing
+    nodisconnect=1
+
+else
+    Connect
+fi
+
+
+# No Command
+if [[ $# -eq 0 ]] ; then
+    # echo "TIP: firejail --netns=$nsName firefox-esr-user-vpn" >&2 # --protocol=unix,inet,inet6,netlink
+    # echo "TIP: sudo ip -4 netns exec $nsName sudo --set-home -u \#$PKEXEC_UID DISPLAY=$cmdDisplay bash" >&2
+    exit 0
+elif [[ "$1" == "null" ]] ; then
+    Say "Nulled command"
+    exit  0
+fi
+
+
+# Command
+[[ $# -ne 0 ]] && Say "Running command: $*" || exit 0
+
+if [[ -n "$PKEXEC_UID" || -n "$SUDO_UID" ]] ; then
+    pushd "$cmdPath" >/dev/null
+    ip -4 netns exec $nsName sudo --set-home -u \#${PKEXEC_UID:-$SUDO_UID} DISPLAY=$cmdDisplay "$@"
+    ret=$?
+    popd >/dev/null
+else
+    ip -4 netns exec $nsName env DISPLAY=$cmdDisplay "$@"
+    ret=$?
+fi
+[[ $ret -ne 0 ]] && Say "Command exited with signal $ret"
+
+if [[ -z "$nodisconnect" ]] ; then
+    Disconnect "$profileFile"
+fi
+
+exit $ret
