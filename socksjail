@@ -106,6 +106,7 @@ if [[ $( id -u ) == "0" ]] ; then
 fi
 profilePath="$HOME/.config/socksjail"
 appCachePath="$HOME/.cache/socksjail"
+socksCheckUrl="https://9.9.9.10/dns-query?dns=q80BAAABAAAAAAAABXF1YWQ5A25ldAAAAQAB" # quad9.net
 
 
 # INIT: Check netns
@@ -243,7 +244,7 @@ fi
 [[ $addr =~ ^: ]] && localhost=localhost
 code=$( curl -L -s -o /dev/null -w "%{http_code}" \
               --proxy "socks4a://${auth+$auth@}$localhost$addr" \
-              "https://9.9.9.10/dns-query?name=quad9.net"
+              "$socksCheckUrl"
       )
 [[ $code == "200" ]] || Die "Failed to connect SOCKS server: $addr"
 
