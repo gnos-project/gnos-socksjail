@@ -118,6 +118,7 @@ Connect ()
 listen_addresses = ['$ip_tun:53']
 user_name = '$userName'
 
+# DEV CACHE
 # cache = true
 # cache_size = 512
 # cache_min_ttl = 600
@@ -125,18 +126,15 @@ user_name = '$userName'
 # cache_neg_min_ttl = 60
 # cache_neg_max_ttl = 600
 
-[query_log]
-file = '/tmp/dnsq'
-format = 'tsv'
+# DEV DEBUG
+# [query_log]
+# file = '$cachePath/$profileName/dnscrypt.log'
+# format = 'tsv'
 
 [static]
 [static.'default']
 stamp = '$sdns'
 EOF
-# DBG
-# [query_log]
-# file = '/tmp/dnsq'
-# format = 'tsv'
     chown --reference="$cachePath/$profileName" "$cachePath/$profileName/dnscrypt-proxy.toml"
 
     ip netns exec $nsName sudo nohup dnscrypt-proxy \
@@ -233,7 +231,7 @@ appPath="$( dirname "$( readlink -f "$BASH_SOURCE" )" )"
 prefix=socks_
 
 
-# INIT: DOH IP-only stamps, use: https://dnscrypt.info/stamps/
+# INIT: DOH server IP-only stamps, use: https://dnscrypt.info/stamps/
 sdns='sdns://AgYAAAAAAAAACDkuOS45LjEwAAg5LjkuOS4xMAovZG5zLXF1ZXJ5' # quad9
 
 
@@ -291,7 +289,6 @@ nsName=$nicName
 # # INIT: DEPS: dnscrypt-proxy
 # if ! which dnscrypt-proxy &>/dev/null ; then
 #        add-apt-repository --yes ppa:shevchuk/dnscrypt-proxy \
-#     && apt update \
 #     && apt install dnscrypt-proxy \
 #     && systemctl stop dnscrypt-proxy.socket  \
 #     && systemctl mask dnscrypt-proxy.socket  \
